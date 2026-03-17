@@ -1,0 +1,10 @@
+[project]
+name = "rds-export"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "boto3>=1.42.61",
+    "pyarrow>=23.0.1",
+    "python-dotenv>=1.0.0",
+]
