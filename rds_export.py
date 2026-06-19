@@ -11,7 +11,7 @@ import shutil
 import sys
 import time
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import boto3
@@ -51,48 +51,120 @@ IAM_ROLE_ARN = os.getenv("IAM_ROLE_ARN")
 CLUSTER_ID = os.getenv("CLUSTER_ID")
 LOCAL_TMP = "/tmp/rds-export"
 
-# Validate required environment variables
-required_vars = {
-    "S3_BUCKET": S3_BUCKET,
-    "KMS_KEY_ARN": KMS_KEY_ARN,
-    "IAM_ROLE_ARN": IAM_ROLE_ARN,
-    "CLUSTER_ID": CLUSTER_ID,
-}
-missing_vars = [name for name, value in required_vars.items() if not value]
-if missing_vars:
-    log_error(f"Missing required environment variables: {', '.join(missing_vars)}")
-    log_error("Create a .env file with these values or set them in your environment.")
-    sys.exit(1)
+def validate_config() -> None:
+    """Validate required environment variables."""
+    required_vars = {
+        "S3_BUCKET": S3_BUCKET,
+        "KMS_KEY_ARN": KMS_KEY_ARN,
+        "IAM_ROLE_ARN": IAM_ROLE_ARN,
+        "CLUSTER_ID": CLUSTER_ID,
+    }
+    missing_vars = [name for name, value in required_vars.items() if not value]
+    if missing_vars:
+        log_error(f"Missing required environment variables: {', '.join(missing_vars)}")
+        log_error("Create a .env file with these values or set them in your environment.")
+        sys.exit(1)
 
 
-def get_latest_snapshot(rds_client, cluster_id: str) -> tuple[str, str, str]:
-    """Get the latest RDS cluster snapshot ARN, ID, and creation time.
+def format_snapshot_time(snapshot: dict) -> str:
+    """Format an RDS snapshot creation time for display."""
+    return snapshot["SnapshotCreateTime"].strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def get_cluster_snapshots(rds_client, cluster_id: str) -> list[dict]:
+    """Get manual RDS cluster snapshots for the configured cluster."""
+    paginator = rds_client.get_paginator("describe_db_cluster_snapshots")
+    snapshots = []
+
+    for page in paginator.paginate(
+        DBClusterIdentifier=cluster_id,
+        SnapshotType="manual",
+    ):
+        snapshots.extend(page["DBClusterSnapshots"])
+
+    return sorted(
+        snapshots,
+        key=lambda snapshot: snapshot["SnapshotCreateTime"],
+        reverse=True,
+    )
+
+
+def get_snapshot_by_id(rds_client, snapshot_id: str) -> tuple[str, str, str]:
+    """Get a cluster snapshot by ID.
 
     Returns:
         Tuple of (snapshot_arn, snapshot_id, creation_time)
     """
-    log_info("Finding latest RDS snapshot...")
+    log_info(f"Finding snapshot: {snapshot_id}")
 
     response = rds_client.describe_db_cluster_snapshots(
-        DBClusterIdentifier=cluster_id
+        DBClusterSnapshotIdentifier=snapshot_id
     )
 
     snapshots = response["DBClusterSnapshots"]
     if not snapshots:
-        log_error("No snapshots found for cluster: %s", cluster_id)
+        log_error(f"Snapshot not found: {snapshot_id}")
         sys.exit(1)
 
-    # Sort by creation time and get the latest
-    latest = max(snapshots, key=lambda s: s["SnapshotCreateTime"])
+    snapshot = snapshots[0]
+    if snapshot["Status"] != "available":
+        log_error(f"Snapshot is not available yet: {snapshot_id} ({snapshot['Status']})")
+        sys.exit(1)
 
-    snapshot_arn = latest["DBClusterSnapshotArn"]
-    snapshot_id = latest["DBClusterSnapshotIdentifier"]
-    creation_time = latest["SnapshotCreateTime"].strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    log_info(f"Latest snapshot: {snapshot_id}")
+    creation_time = format_snapshot_time(snapshot)
+    log_info(f"Snapshot: {snapshot_id}")
     log_info(f"Created: {creation_time}")
 
-    return snapshot_arn, snapshot_id, creation_time
+    return snapshot["DBClusterSnapshotArn"], snapshot_id, creation_time
+
+
+def select_recent_snapshot(
+    rds_client,
+    cluster_id: str,
+    recent_days: int,
+) -> tuple[str, str, str]:
+    """Select an available cluster snapshot from recent snapshots or by name."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=recent_days)
+    snapshots = [
+        snapshot
+        for snapshot in get_cluster_snapshots(rds_client, cluster_id)
+        if snapshot["SnapshotCreateTime"] >= cutoff
+    ]
+
+    available_snapshots = [
+        snapshot for snapshot in snapshots if snapshot["Status"] == "available"
+    ]
+
+    print()
+    if available_snapshots:
+        print(f"Available snapshots from the last {recent_days} days:")
+        for index, snapshot in enumerate(available_snapshots, start=1):
+            snapshot_id = snapshot["DBClusterSnapshotIdentifier"]
+            created = format_snapshot_time(snapshot)
+            print(f"  {index}. {snapshot_id} ({created})")
+        print("  m. Enter snapshot name manually")
+
+        while True:
+            choice = input("Select snapshot: ").strip().lower()
+            if choice == "m":
+                break
+
+            if choice.isdigit() and 1 <= int(choice) <= len(available_snapshots):
+                snapshot = available_snapshots[int(choice) - 1]
+                snapshot_id = snapshot["DBClusterSnapshotIdentifier"]
+                creation_time = format_snapshot_time(snapshot)
+                return snapshot["DBClusterSnapshotArn"], snapshot_id, creation_time
+
+            print(f"Invalid selection. Use 1-{len(available_snapshots)} or m.")
+    else:
+        log_warn(f"No available snapshots found from the last {recent_days} days.")
+
+    snapshot_id = input("Enter snapshot name: ").strip()
+    if not snapshot_id:
+        log_error("Snapshot name is required.")
+        sys.exit(1)
+
+    return get_snapshot_by_id(rds_client, snapshot_id)
 
 
 def start_export_task(
@@ -171,13 +243,25 @@ def download_from_s3(s3_client, s3_bucket: str, export_id: str, local_dir: str) 
     os.makedirs(export_dir, exist_ok=True)
 
     bucket = s3_client.Bucket(s3_bucket)
-    bucket.objects.filter(Prefix=f"{export_id}/").download_file(export_dir)
+    downloaded_files = 0
+    for obj in bucket.objects.filter(Prefix=f"{export_id}/"):
+        relative_key = os.path.relpath(obj.key, export_id)
+        if relative_key == ".":
+            continue
+
+        local_path = os.path.join(export_dir, relative_key)
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        bucket.download_file(obj.key, local_path)
+        downloaded_files += 1
+
+    if downloaded_files == 0:
+        raise RuntimeError(f"No files found in s3://{s3_bucket}/{export_id}/")
 
     # Calculate total size
     total_size = sum(
-        f.stat().st_size
-        for f in os.scandir(export_dir)
-        if f.is_file()
+        os.path.getsize(os.path.join(root, file))
+        for root, _, files in os.walk(export_dir)
+        for file in files
     )
 
     # Convert to human-readable format
@@ -245,6 +329,77 @@ def cleanup_s3(s3_client, s3_bucket: str, export_id: str) -> None:
     log_info("S3 files deleted")
 
 
+def snapshot_id_from_arn(snapshot_arn: str) -> str:
+    """Extract a snapshot identifier from an RDS snapshot ARN."""
+    return snapshot_arn.rsplit(":", 1)[-1]
+
+
+def get_export_task(rds_client, export_id: str) -> dict:
+    """Get a single RDS export task."""
+    response = rds_client.describe_export_tasks(
+        ExportTaskIdentifier=export_id
+    )
+
+    if not response["ExportTasks"]:
+        raise RuntimeError(f"Export task not found: {export_id}")
+
+    return response["ExportTasks"][0]
+
+
+def finish_export(
+    rds_client,
+    s3_client,
+    args: argparse.Namespace,
+    export_id: str,
+    snapshot_id: str | None,
+    snapshot_time: str | None,
+) -> tuple[str, str]:
+    """Download, zip, and optionally clean up a completed export."""
+    task = get_export_task(rds_client, export_id)
+    status = task["Status"]
+    if status != "COMPLETE":
+        raise RuntimeError(f"Export task is not complete: {export_id} ({status})")
+
+    if not snapshot_id:
+        snapshot_id = snapshot_id_from_arn(task["SourceArn"])
+    if not snapshot_time:
+        try:
+            _, _, snapshot_time = get_snapshot_by_id(rds_client, snapshot_id)
+        except Exception:
+            snapshot_time = "unknown"
+
+    # Download from S3
+    download_size = download_from_s3(s3_client, S3_BUCKET, export_id, LOCAL_TMP)
+
+    # Create zip archive
+    zip_filename, zip_size = create_zip_archive(LOCAL_TMP, export_id)
+
+    # Delete original parquet files
+    delete_parquet_files(LOCAL_TMP, export_id)
+
+    # Cleanup S3 (optional)
+    if args.cleanup_s3:
+        cleanup_s3(s3_client, S3_BUCKET, export_id)
+    elif not args.keep_s3:
+        response = input("Delete exported files from S3? (y/N): ")
+        if response.lower() == "y":
+            cleanup_s3(s3_client, S3_BUCKET, export_id)
+
+    # Summary
+    print()
+    log_info("=" * 30)
+    log_info("SUMMARY")
+    log_info("=" * 30)
+    log_info(f"Snapshot: {snapshot_id}")
+    log_info(f"Created:  {snapshot_time}")
+    log_info(f"Export ID: {export_id}")
+    log_info(f"Downloaded: {download_size}")
+    log_info(f"Local zip: {Path(LOCAL_TMP, zip_filename)} ({zip_size})")
+    log_info("=" * 30)
+
+    return zip_filename, zip_size
+
+
 def main() -> int:
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -260,7 +415,25 @@ def main() -> int:
         action="store_true",
         help="Keep exported files in S3 (default: prompt)",
     )
+    parser.add_argument(
+        "--snapshot-id",
+        help="Cluster snapshot identifier to export. If omitted, choose from a list.",
+    )
+    parser.add_argument(
+        "--recent-days",
+        type=int,
+        default=7,
+        help="How many days of snapshots to show in the interactive list.",
+    )
+    parser.add_argument(
+        "--resume-export-id",
+        help="Continue from a completed export task by downloading and zipping its S3 files.",
+    )
     args = parser.parse_args()
+    if args.recent_days < 1:
+        log_error("--recent-days must be at least 1.")
+        return 1
+    validate_config()
 
     # Initialize boto3 clients
     rds = boto3.client("rds", region_name="eu-west-1")
@@ -271,8 +444,29 @@ def main() -> int:
     os.chdir(LOCAL_TMP)
 
     try:
-        # 1. Get latest snapshot
-        snapshot_arn, snapshot_id, snapshot_time = get_latest_snapshot(rds, CLUSTER_ID)
+        if args.resume_export_id:
+            finish_export(
+                rds,
+                s3,
+                args,
+                args.resume_export_id,
+                snapshot_id=None,
+                snapshot_time=None,
+            )
+            return 0
+
+        # 1. Select snapshot
+        if args.snapshot_id:
+            snapshot_arn, snapshot_id, snapshot_time = get_snapshot_by_id(
+                rds,
+                args.snapshot_id,
+            )
+        else:
+            snapshot_arn, snapshot_id, snapshot_time = select_recent_snapshot(
+                rds,
+                CLUSTER_ID,
+                args.recent_days,
+            )
 
         # 2. Start export task
         export_id = start_export_task(
@@ -286,33 +480,15 @@ def main() -> int:
         # 3. Wait for completion
         wait_for_export_completion(rds, export_id)
 
-        # 4. Download from S3
-        download_size = download_from_s3(s3, S3_BUCKET, export_id, LOCAL_TMP)
-
-        # 5. Create zip archive
-        zip_filename, zip_size = create_zip_archive(LOCAL_TMP, export_id)
-
-        # 6. Delete original parquet files
-        delete_parquet_files(LOCAL_TMP, export_id)
-
-        # 7. Cleanup S3 (optional)
-        if args.cleanup_s3:
-            cleanup_s3(s3, S3_BUCKET, export_id)
-        elif not args.keep_s3:
-            response = input("Delete exported files from S3? (y/N): ")
-            if response.lower() == "y":
-                cleanup_s3(s3, S3_BUCKET, export_id)
-
-        # Summary
-        print()
-        log_info("=" * 30)
-        log_info("SUMMARY")
-        log_info("=" * 30)
-        log_info(f"Snapshot: {snapshot_id}")
-        log_info(f"Created:  {snapshot_time}")
-        log_info(f"Export ID: {export_id}")
-        log_info(f"Local zip: {os.path.join(LOCAL_TMP, zip_filename)} ({zip_size})")
-        log_info("=" * 30)
+        # 4. Download, zip, and optionally clean up
+        finish_export(
+            rds,
+            s3,
+            args,
+            export_id,
+            snapshot_id=snapshot_id,
+            snapshot_time=snapshot_time,
+        )
 
         return 0
 

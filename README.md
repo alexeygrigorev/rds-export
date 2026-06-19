@@ -18,21 +18,52 @@ cp .env.example .env
 
 ## Scripts
 
-### 1. Export RDS Snapshot to Zip
+### 1. Create RDS Snapshot
 
-Exports the latest RDS snapshot to S3 as Parquet files, then downloads and creates a zip archive.
+Creates a manual RDS snapshot for one of the configured databases:
+
+- `aisl` - `ai-shipping-labs`, snapshot names like `aisl-YYYY-MM-DD`
+- `cmp` - `course-management-manual`, snapshot names like `cmp-YYYY-MM-DD`
 
 ```bash
+# Interactive mode
+uv run create_snapshot.py
+
+# Select a database directly
+uv run create_snapshot.py --db aisl
+uv run create_snapshot.py --db cmp
+
+# Start the snapshot and exit immediately
+uv run create_snapshot.py --db cmp --no-wait
+```
+
+By default, the script polls AWS until the snapshot is available.
+
+### 2. Export RDS Snapshot to Zip
+
+Exports a selected RDS snapshot to S3 as Parquet files, then downloads and creates a zip archive.
+
+```bash
+# Interactive mode: choose from available manual snapshots created in the last 7 days
 uv run rds_export.py
+
+# Export a specific snapshot
+uv run rds_export.py --snapshot-id cmp-2026-06-19
+
+# Continue after a failed download/zip step
+uv run rds_export.py --resume-export-id rds-export-1781876924
 ```
 
 **Options:**
+- `--snapshot-id <name>` - Export a specific snapshot by name
+- `--recent-days <days>` - Number of days to show in the interactive snapshot list
+- `--resume-export-id <id>` - Continue from a completed export task
 - `--cleanup-s3` - Delete exported files from S3 after creating zip
 - `--keep-s3` - Keep exported files in S3 (no prompt)
 
 **Output:** `rds-backup-YYYYMMDD-HHMMSS.zip` in `/tmp/rds-export/`
 
-### 2. Convert Parquet to SQLite
+### 3. Convert Parquet to SQLite
 
 Converts Parquet files from the zip archive to a SQLite database.
 
