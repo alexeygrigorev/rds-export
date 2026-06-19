@@ -14,11 +14,15 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import boto3
 import pyarrow as pa
 import pyarrow.parquet as pq
+from dotenv import load_dotenv
 
 # Configuration
+load_dotenv()
 LOCAL_TMP = "/tmp/rds-export"
+S3_BUCKET = os.getenv("S3_BUCKET")
 
 
 class Colors:
@@ -45,6 +49,21 @@ def log_error(msg: str) -> None:
     print(f"{Colors.RED}[ERROR]{Colors.NC} {msg}")
 
 
+def upload_sqlite_to_s3(db_path: Path, bucket: str, prefix: str) -> str:
+    """Upload a SQLite database file to S3.
+
+    Returns:
+        The S3 URI of the uploaded file.
+    """
+    normalized_prefix = prefix.strip("/")
+    s3_key = f"{normalized_prefix}/{db_path.name}" if normalized_prefix else db_path.name
+
+    log_info(f"Uploading SQLite database to s3://{bucket}/{s3_key}")
+    boto3.client("s3").upload_file(str(db_path), bucket, s3_key)
+
+    return f"s3://{bucket}/{s3_key}"
+
+
 def find_zip_files(base_dir: str) -> list[Path]:
     """Find all zip files in the specified directory."""
     base_path = Path(base_dir)
@@ -64,14 +83,17 @@ def list_schemas(zip_path: Path) -> list[str]:
 
     with zipfile.ZipFile(zip_path, "r") as zf:
         for name in zf.namelist():
+            if not name.endswith(".parquet"):
+                continue
+
             parts = Path(name).parts
-            # Handle both formats: "export_id/schema/..." or "schema/..."
-            if len(parts) >= 2:
-                # Check first or second part for schema name
-                for part in parts[:2]:
-                    if part in ("dev", "prod", "test_prod"):
-                        schemas.add(part)
-                        break
+            for index, part in enumerate(parts):
+                if "." in part:
+                    if index > 0:
+                        schemas.add(parts[index - 1])
+                    else:
+                        schemas.add(part.split(".", 1)[0])
+                    break
 
     return sorted(schemas)
 
@@ -88,16 +110,29 @@ def extract_schema(zip_path: Path, schema: str, extract_dir: Path) -> Path:
     with zipfile.ZipFile(zip_path, "r") as zf:
         for name in zf.namelist():
             parts = Path(name).parts
-            # Handle both formats: "export_id/schema/..." or "schema/..."
-            if schema in parts[:2]:
-                # Get path starting from schema
+            if schema in parts:
                 schema_idx = parts.index(schema)
                 relative_path = Path(*parts[schema_idx:])
                 target_path = extract_dir / relative_path
-                target_path.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                table_idx = next(
+                    (
+                        index
+                        for index, part in enumerate(parts)
+                        if part.startswith(f"{schema}.")
+                    ),
+                    None,
+                )
+                if table_idx is None:
+                    continue
 
-                with open(target_path, "wb") as f:
-                    f.write(zf.read(name))
+                relative_path = Path(schema, *parts[table_idx:])
+                target_path = extract_dir / relative_path
+
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(target_path, "wb") as f:
+                f.write(zf.read(name))
 
     return schema_dir
 
@@ -264,7 +299,6 @@ def main() -> int:
     parser.add_argument(
         "--schema",
         type=str,
-        choices=["dev", "prod", "test_prod"],
         help="Schema to import (default: prompt)",
     )
     parser.add_argument(
@@ -277,7 +311,25 @@ def main() -> int:
         action="store_true",
         help="List available schemas and exit",
     )
+    parser.add_argument(
+        "--upload-s3",
+        action="store_true",
+        help="Upload the generated SQLite database to S3",
+    )
+    parser.add_argument(
+        "--s3-bucket",
+        default=S3_BUCKET,
+        help="S3 bucket for SQLite upload (default: S3_BUCKET from .env)",
+    )
+    parser.add_argument(
+        "--s3-prefix",
+        default="sqlite",
+        help="S3 prefix for SQLite upload (default: sqlite)",
+    )
     args = parser.parse_args()
+    if args.upload_s3 and not args.s3_bucket:
+        log_error("--upload-s3 requires --s3-bucket or S3_BUCKET in .env")
+        return 1
 
     # Find zip file
     if args.zip:
@@ -336,10 +388,10 @@ def main() -> int:
 
     # Create output database
     if args.output:
-        db_path = args.output
+        db_path = Path(args.output)
     else:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        db_path = str(Path(LOCAL_TMP) / f"rds-{selected_schema}-{timestamp}.db")
+        db_path = Path(LOCAL_TMP) / f"rds-{selected_schema}-{timestamp}.db"
 
     # Create SQLite database
     log_info(f"Creating SQLite database: {db_path}")
@@ -362,6 +414,10 @@ def main() -> int:
     # Cleanup extracted files
     shutil.rmtree(schema_dir)
 
+    s3_uri = None
+    if args.upload_s3:
+        s3_uri = upload_sqlite_to_s3(db_path, args.s3_bucket, args.s3_prefix)
+
     # Summary
     print()
     log_info("=" * 40)
@@ -372,6 +428,8 @@ def main() -> int:
     log_info(f"Total rows:    {total_rows:,}")
     log_info(f"Database:      {db_path}")
     log_info(f"Database size: {Path(db_path).stat().st_size / 1024 / 1024:.1f} MB")
+    if s3_uri:
+        log_info(f"S3 upload:     {s3_uri}")
     log_info("=" * 40)
 
     return 0

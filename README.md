@@ -16,7 +16,51 @@ cp .env.example .env
 # Edit .env with your values
 ```
 
+For unattended runs, the `.env` file must include AWS credentials with permission
+to create RDS snapshots, start RDS export tasks, use the configured export role,
+read/write the backup bucket, and use the export KMS key.
+
 ## Scripts
+
+### Full Pipeline
+
+Runs snapshot creation, export, SQLite conversion, and SQLite upload to S3.
+
+```bash
+# One database
+uv run run_pipeline.py --db cmp --schema prod
+uv run run_pipeline.py --db aisl --schema prod
+
+# Both databases
+uv run run_pipeline.py --db all --schema prod
+```
+
+By default, the pipeline keeps the Parquet export files in S3. Use `--cleanup-export-s3` to delete them after the local zip is created.
+
+### Hetzner Cron
+
+The Hetzner host uses the SSH alias `hetzner`. The deployed checkout lives at:
+
+```bash
+~/rds-export
+```
+
+Initial setup:
+
+```bash
+ssh hetzner 'git clone https://github.com/alexeygrigorev/rds-export.git ~/rds-export'
+scp .env hetzner:~/rds-export/.env
+ssh hetzner 'cd ~/rds-export && uv sync'
+```
+
+Crontab entries:
+
+```cron
+0 1 * * * cd /home/alexey/rds-export && /home/alexey/.local/bin/uv run run_pipeline.py --db cmp --schema prod >> /home/alexey/rds-export/logs/cmp.log 2>&1
+0 2 * * * cd /home/alexey/rds-export && /home/alexey/.local/bin/uv run run_pipeline.py --db aisl --schema prod >> /home/alexey/rds-export/logs/aisl.log 2>&1
+```
+
+Create `~/rds-export/logs` before enabling cron. The server timezone is CEST, so these run at 01:00 and 02:00 server time.
 
 ### 1. Create RDS Snapshot
 
@@ -79,11 +123,16 @@ uv run parquet_to_sqlite.py --list
 
 # Custom output path
 uv run parquet_to_sqlite.py --schema prod --output ~/my-database.db
+
+# Upload generated SQLite database to S3
+uv run parquet_to_sqlite.py --schema prod --upload-s3
 ```
 
-**Available schemas:** `dev`, `prod`, `test_prod`
+Use `--list` to see available schemas/databases in the selected zip.
 
 **Output:** `rds-<schema>-YYYYMMDD-HHMMSS.db` in `/tmp/rds-export/`
+
+**Upload output:** `s3://<S3_BUCKET>/sqlite/rds-<schema>-YYYYMMDD-HHMMSS.db`
 
 ## Viewing Data
 

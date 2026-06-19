@@ -51,14 +51,16 @@ IAM_ROLE_ARN = os.getenv("IAM_ROLE_ARN")
 CLUSTER_ID = os.getenv("CLUSTER_ID")
 LOCAL_TMP = "/tmp/rds-export"
 
-def validate_config() -> None:
+def validate_config(require_cluster_id: bool = True) -> None:
     """Validate required environment variables."""
     required_vars = {
         "S3_BUCKET": S3_BUCKET,
         "KMS_KEY_ARN": KMS_KEY_ARN,
         "IAM_ROLE_ARN": IAM_ROLE_ARN,
-        "CLUSTER_ID": CLUSTER_ID,
     }
+    if require_cluster_id:
+        required_vars["CLUSTER_ID"] = CLUSTER_ID
+
     missing_vars = [name for name, value in required_vars.items() if not value]
     if missing_vars:
         log_error(f"Missing required environment variables: {', '.join(missing_vars)}")
@@ -71,16 +73,32 @@ def format_snapshot_time(snapshot: dict) -> str:
     return snapshot["SnapshotCreateTime"].strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def get_cluster_snapshots(rds_client, cluster_id: str) -> list[dict]:
-    """Get manual RDS cluster snapshots for the configured cluster."""
-    paginator = rds_client.get_paginator("describe_db_cluster_snapshots")
+def get_snapshots(
+    rds_client,
+    source_id: str,
+    snapshot_type: str,
+) -> list[dict]:
+    """Get manual RDS snapshots for the configured source."""
+    if snapshot_type == "cluster":
+        paginator_name = "describe_db_cluster_snapshots"
+        paginate_args = {
+            "DBClusterIdentifier": source_id,
+            "SnapshotType": "manual",
+        }
+        response_key = "DBClusterSnapshots"
+    else:
+        paginator_name = "describe_db_snapshots"
+        paginate_args = {
+            "DBInstanceIdentifier": source_id,
+            "SnapshotType": "manual",
+        }
+        response_key = "DBSnapshots"
+
+    paginator = rds_client.get_paginator(paginator_name)
     snapshots = []
 
-    for page in paginator.paginate(
-        DBClusterIdentifier=cluster_id,
-        SnapshotType="manual",
-    ):
-        snapshots.extend(page["DBClusterSnapshots"])
+    for page in paginator.paginate(**paginate_args):
+        snapshots.extend(page[response_key])
 
     return sorted(
         snapshots,
@@ -89,19 +107,38 @@ def get_cluster_snapshots(rds_client, cluster_id: str) -> list[dict]:
     )
 
 
-def get_snapshot_by_id(rds_client, snapshot_id: str) -> tuple[str, str, str]:
-    """Get a cluster snapshot by ID.
+def snapshot_arn_key(snapshot_type: str) -> str:
+    return "DBClusterSnapshotArn" if snapshot_type == "cluster" else "DBSnapshotArn"
+
+
+def snapshot_id_key(snapshot_type: str) -> str:
+    return "DBClusterSnapshotIdentifier" if snapshot_type == "cluster" else "DBSnapshotIdentifier"
+
+
+def get_snapshot_by_id(
+    rds_client,
+    snapshot_id: str,
+    snapshot_type: str,
+) -> tuple[str, str, str]:
+    """Get a snapshot by ID.
 
     Returns:
         Tuple of (snapshot_arn, snapshot_id, creation_time)
     """
     log_info(f"Finding snapshot: {snapshot_id}")
 
-    response = rds_client.describe_db_cluster_snapshots(
-        DBClusterSnapshotIdentifier=snapshot_id
-    )
+    if snapshot_type == "cluster":
+        response = rds_client.describe_db_cluster_snapshots(
+            DBClusterSnapshotIdentifier=snapshot_id
+        )
+        response_key = "DBClusterSnapshots"
+    else:
+        response = rds_client.describe_db_snapshots(
+            DBSnapshotIdentifier=snapshot_id
+        )
+        response_key = "DBSnapshots"
 
-    snapshots = response["DBClusterSnapshots"]
+    snapshots = response[response_key]
     if not snapshots:
         log_error(f"Snapshot not found: {snapshot_id}")
         sys.exit(1)
@@ -115,19 +152,20 @@ def get_snapshot_by_id(rds_client, snapshot_id: str) -> tuple[str, str, str]:
     log_info(f"Snapshot: {snapshot_id}")
     log_info(f"Created: {creation_time}")
 
-    return snapshot["DBClusterSnapshotArn"], snapshot_id, creation_time
+    return snapshot[snapshot_arn_key(snapshot_type)], snapshot_id, creation_time
 
 
 def select_recent_snapshot(
     rds_client,
-    cluster_id: str,
+    source_id: str,
+    snapshot_type: str,
     recent_days: int,
 ) -> tuple[str, str, str]:
-    """Select an available cluster snapshot from recent snapshots or by name."""
+    """Select an available snapshot from recent snapshots or by name."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=recent_days)
     snapshots = [
         snapshot
-        for snapshot in get_cluster_snapshots(rds_client, cluster_id)
+        for snapshot in get_snapshots(rds_client, source_id, snapshot_type)
         if snapshot["SnapshotCreateTime"] >= cutoff
     ]
 
@@ -139,7 +177,7 @@ def select_recent_snapshot(
     if available_snapshots:
         print(f"Available snapshots from the last {recent_days} days:")
         for index, snapshot in enumerate(available_snapshots, start=1):
-            snapshot_id = snapshot["DBClusterSnapshotIdentifier"]
+            snapshot_id = snapshot[snapshot_id_key(snapshot_type)]
             created = format_snapshot_time(snapshot)
             print(f"  {index}. {snapshot_id} ({created})")
         print("  m. Enter snapshot name manually")
@@ -151,9 +189,9 @@ def select_recent_snapshot(
 
             if choice.isdigit() and 1 <= int(choice) <= len(available_snapshots):
                 snapshot = available_snapshots[int(choice) - 1]
-                snapshot_id = snapshot["DBClusterSnapshotIdentifier"]
+                snapshot_id = snapshot[snapshot_id_key(snapshot_type)]
                 creation_time = format_snapshot_time(snapshot)
-                return snapshot["DBClusterSnapshotArn"], snapshot_id, creation_time
+                return snapshot[snapshot_arn_key(snapshot_type)], snapshot_id, creation_time
 
             print(f"Invalid selection. Use 1-{len(available_snapshots)} or m.")
     else:
@@ -164,7 +202,7 @@ def select_recent_snapshot(
         log_error("Snapshot name is required.")
         sys.exit(1)
 
-    return get_snapshot_by_id(rds_client, snapshot_id)
+    return get_snapshot_by_id(rds_client, snapshot_id, snapshot_type)
 
 
 def start_export_task(
@@ -353,6 +391,7 @@ def finish_export(
     export_id: str,
     snapshot_id: str | None,
     snapshot_time: str | None,
+    snapshot_type: str,
 ) -> tuple[str, str]:
     """Download, zip, and optionally clean up a completed export."""
     task = get_export_task(rds_client, export_id)
@@ -364,7 +403,11 @@ def finish_export(
         snapshot_id = snapshot_id_from_arn(task["SourceArn"])
     if not snapshot_time:
         try:
-            _, _, snapshot_time = get_snapshot_by_id(rds_client, snapshot_id)
+            _, _, snapshot_time = get_snapshot_by_id(
+                rds_client,
+                snapshot_id,
+                snapshot_type,
+            )
         except Exception:
             snapshot_time = "unknown"
 
@@ -417,7 +460,17 @@ def main() -> int:
     )
     parser.add_argument(
         "--snapshot-id",
-        help="Cluster snapshot identifier to export. If omitted, choose from a list.",
+        help="Snapshot identifier to export. If omitted, choose from a list.",
+    )
+    parser.add_argument(
+        "--snapshot-type",
+        choices=["cluster", "instance"],
+        default="cluster",
+        help="Snapshot type to export.",
+    )
+    parser.add_argument(
+        "--source-id",
+        help="DB cluster or DB instance identifier for the interactive snapshot list.",
     )
     parser.add_argument(
         "--recent-days",
@@ -433,11 +486,15 @@ def main() -> int:
     if args.recent_days < 1:
         log_error("--recent-days must be at least 1.")
         return 1
-    validate_config()
+    validate_config(require_cluster_id=not args.source_id)
 
     # Initialize boto3 clients
     rds = boto3.client("rds", region_name="eu-west-1")
     s3 = boto3.resource("s3", region_name="eu-west-1")
+    source_id = args.source_id or CLUSTER_ID
+    if not source_id:
+        log_error("--source-id is required when CLUSTER_ID is not set.")
+        return 1
 
     # Create temp directory
     os.makedirs(LOCAL_TMP, exist_ok=True)
@@ -452,6 +509,7 @@ def main() -> int:
                 args.resume_export_id,
                 snapshot_id=None,
                 snapshot_time=None,
+                snapshot_type=args.snapshot_type,
             )
             return 0
 
@@ -460,11 +518,13 @@ def main() -> int:
             snapshot_arn, snapshot_id, snapshot_time = get_snapshot_by_id(
                 rds,
                 args.snapshot_id,
+                args.snapshot_type,
             )
         else:
             snapshot_arn, snapshot_id, snapshot_time = select_recent_snapshot(
                 rds,
-                CLUSTER_ID,
+                source_id,
+                args.snapshot_type,
                 args.recent_days,
             )
 
@@ -488,6 +548,7 @@ def main() -> int:
             export_id,
             snapshot_id=snapshot_id,
             snapshot_time=snapshot_time,
+            snapshot_type=args.snapshot_type,
         )
 
         return 0
