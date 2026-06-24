@@ -29,13 +29,15 @@ Runs snapshot creation, export, SQLite conversion, and SQLite upload to S3.
 ```bash
 # One database
 uv run run_pipeline.py --db cmp --schema prod
-uv run run_pipeline.py --db aisl --schema prod
+uv run run_pipeline.py --db aisl --schema aisl_prod
 
 # Both databases
-uv run run_pipeline.py --db all --schema prod
+uv run run_pipeline.py --db all
 ```
 
 By default, the pipeline keeps the Parquet export files in S3. Use `--cleanup-export-s3` to delete them after the local zip is created.
+If `--schema` is omitted, the pipeline uses the default schema for each database:
+`prod` for CMP and `aisl_prod` for AI Shipping Labs.
 
 ### Hetzner Cron
 
@@ -57,7 +59,7 @@ Crontab entries:
 
 ```cron
 0 1 * * * cd /home/alexey/rds-export && /home/alexey/.local/bin/uv run run_pipeline.py --db cmp --schema prod >> /home/alexey/rds-export/logs/cmp.log 2>&1
-0 2 * * * cd /home/alexey/rds-export && /home/alexey/.local/bin/uv run run_pipeline.py --db aisl --schema prod >> /home/alexey/rds-export/logs/aisl.log 2>&1
+0 2 * * * cd /home/alexey/rds-export && /home/alexey/.local/bin/uv run run_pipeline.py --db aisl --schema aisl_prod >> /home/alexey/rds-export/logs/aisl.log 2>&1
 ```
 
 Create `~/rds-export/logs` before enabling cron. The server timezone is CEST, so these run at 01:00 and 02:00 server time.
@@ -133,6 +135,35 @@ Use `--list` to see available schemas/databases in the selected zip.
 **Output:** `rds-<schema>-YYYYMMDD-HHMMSS.db` in `/tmp/rds-export/`
 
 **Upload output:** `s3://<S3_BUCKET>/sqlite/rds-<schema>-YYYYMMDD-HHMMSS.db`
+
+### 4. Clean Up Old Manual Snapshots
+
+Lists manual RDS snapshots older than a retention window and optionally deletes
+them. The command is a dry run unless `--delete` is passed.
+
+```bash
+# Dry run for AI Shipping Labs instance snapshots older than 7 days
+uv run cleanup_snapshots.py \
+  --db-instance-id ai-shipping-labs \
+  --snapshot-prefix aisl- \
+  --retention-days 7
+
+# Delete the snapshots shown by the same filter
+uv run cleanup_snapshots.py \
+  --db-instance-id ai-shipping-labs \
+  --snapshot-prefix aisl- \
+  --retention-days 7 \
+  --delete
+
+# Dry run for CMP cluster snapshots
+uv run cleanup_snapshots.py \
+  --db-cluster-id course-management-manual \
+  --snapshot-prefix cmp- \
+  --retention-days 30
+```
+
+The cleanup command only queries snapshots with `SnapshotType=manual`; automated
+RDS backups are not selected.
 
 ## Viewing Data
 

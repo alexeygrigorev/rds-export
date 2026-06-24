@@ -30,6 +30,7 @@ class Database:
     name: str
     snapshot_type: str
     source_id: str
+    default_schema: str
 
 
 DATABASES = {
@@ -38,12 +39,14 @@ DATABASES = {
         name="AI Shipping Labs",
         snapshot_type="instance",
         source_id="ai-shipping-labs",
+        default_schema="aisl_prod",
     ),
     "cmp": Database(
         key="cmp",
         name="Course Management",
         snapshot_type="cluster",
         source_id="course-management-manual",
+        default_schema="prod",
     ),
 }
 
@@ -51,7 +54,7 @@ DATABASES = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the full RDS backup pipeline.")
     parser.add_argument("--db", choices=["aisl", "cmp", "all"], required=True)
-    parser.add_argument("--schema", default="prod", help="Schema/database to convert to SQLite.")
+    parser.add_argument("--schema", help="Schema/database to convert to SQLite.")
     parser.add_argument("--region", default="eu-west-1", help="AWS region.")
     parser.add_argument("--poll-interval", type=int, default=30, help="Seconds between snapshot status checks.")
     parser.add_argument(
@@ -150,6 +153,19 @@ def export_snapshot(db: Database, snapshot_id: str, cleanup_export_s3: bool) -> 
     run_step(command)
 
 
+def resolve_schema(db: Database, schema: str | None) -> str:
+    if schema is None:
+        return db.default_schema
+
+    aliases = {
+        "aisl": {
+            "dev": "aisl_dev",
+            "prod": "aisl_prod",
+        },
+    }
+    return aliases.get(db.key, {}).get(schema, schema)
+
+
 def convert_and_upload_sqlite(db: Database, schema: str) -> None:
     print()
     print(f"=== {db.name}: convert {schema} to SQLite and upload ===")
@@ -166,7 +182,7 @@ def run_pipeline(db: Database, args: argparse.Namespace) -> None:
     rds_client = boto3.client("rds", region_name=args.region)
     snapshot_id = create_snapshot(rds_client, db, args.poll_interval)
     export_snapshot(db, snapshot_id, args.cleanup_export_s3)
-    convert_and_upload_sqlite(db, args.schema)
+    convert_and_upload_sqlite(db, resolve_schema(db, args.schema))
 
 
 def main() -> int:
