@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 # Configuration
 load_dotenv()
-LOCAL_TMP = "/tmp/rds-export"
+LOCAL_TMP = os.getenv("LOCAL_TMP", "/data/tmp/rds-export")
 S3_BUCKET = os.getenv("S3_BUCKET")
 
 
@@ -286,6 +286,32 @@ def select_interactive(options: list[str], prompt: str, default: int = 0) -> str
             sys.exit(1)
 
 
+def create_empty_sqlite_artifact(args: argparse.Namespace, schema: str) -> int:
+    """Record a valid export that contains no schemas or tables."""
+    if args.output:
+        db_path = Path(args.output)
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        db_path = Path(LOCAL_TMP) / f"rds-{schema}-{timestamp}.db"
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(db_path)
+    connection.close()
+
+    s3_uri = None
+    if args.upload_s3:
+        s3_uri = upload_sqlite_to_s3(db_path, args.s3_bucket, args.s3_prefix)
+
+    log_warn(
+        "The export contains no schemas or tables; created an empty SQLite "
+        f"artifact for the explicitly requested schema: {schema}"
+    )
+    log_info(f"Database:      {db_path}")
+    if s3_uri:
+        log_info(f"S3 upload:     {s3_uri}")
+    return 0
+
+
 def main() -> int:
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -349,8 +375,10 @@ def main() -> int:
     # List schemas
     schemas = list_schemas(zip_path)
     if not schemas:
-        log_error("No schemas found in zip file")
-        return 1
+        if args.list or not args.schema:
+            log_error("No schemas found in zip file; pass --schema for an empty export")
+            return 1
+        return create_empty_sqlite_artifact(args, args.schema)
 
     if args.list:
         print(f"\nAvailable schemas in {zip_path.name}:")

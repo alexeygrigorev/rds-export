@@ -49,7 +49,7 @@ S3_BUCKET = os.getenv("S3_BUCKET")
 KMS_KEY_ARN = os.getenv("KMS_KEY_ARN")
 IAM_ROLE_ARN = os.getenv("IAM_ROLE_ARN")
 CLUSTER_ID = os.getenv("CLUSTER_ID")
-LOCAL_TMP = "/tmp/rds-export"
+LOCAL_TMP = os.getenv("LOCAL_TMP", "/data/tmp/rds-export")
 
 def validate_config(require_cluster_id: bool = True) -> None:
     """Validate required environment variables."""

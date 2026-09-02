@@ -79,6 +79,12 @@ Each target uses its own `${LOCAL_TMP}/<db-key>` workspace. That isolation is
 required because the jobs may overlap: without it, one pipeline could select
 another database's most recent export zip during SQLite conversion.
 
+An initial database with no schemas or tables still produces a successful RDS
+Parquet export. When the pipeline supplied an explicit `--schema`, the
+converter records that state as a valid empty SQLite artifact and uploads it.
+It continues to fail closed when no schema was supplied, or when a non-empty
+export does not contain the requested schema.
+
 ### 1. Create RDS Snapshot
 
 Creates a manual RDS snapshot for one of the configured databases:
