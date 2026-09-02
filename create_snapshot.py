@@ -7,12 +7,13 @@ This is the first step before exporting the latest snapshot to S3.
 
 import argparse
 import time
-from dataclasses import dataclass
 from datetime import datetime
 
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 from dotenv import load_dotenv
+
+from database_catalog import DATABASES, Database
 
 
 load_dotenv()
@@ -39,30 +40,6 @@ def log_warn(msg: str) -> None:
 def log_error(msg: str) -> None:
     """Print an error message."""
     print(f"{Colors.RED}[ERROR]{Colors.NC} {msg}")
-
-
-@dataclass(frozen=True)
-class Database:
-    key: str
-    name: str
-    snapshot_type: str
-    identifier: str
-
-
-DATABASES = (
-    Database(
-        key="aisl",
-        name="AI Shipping Labs",
-        snapshot_type="instance",
-        identifier="ai-shipping-labs",
-    ),
-    Database(
-        key="cmp",
-        name="Course Management",
-        snapshot_type="cluster",
-        identifier="course-management-manual",
-    ),
-)
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,10 +78,10 @@ def select_database(selected_key: str | None) -> Database:
     print()
     print("Select DB to snapshot:")
     for index, db in enumerate(DATABASES, start=1):
-        print(f"  {index}. {db.name} ({db.identifier}) -> {db.key}-YYYY-MM-DD")
+        print(f"  {index}. {db.name} ({db.source_id}) -> {db.key}-YYYY-MM-DD")
 
     while True:
-        choice = input("Enter 1 or 2: ").strip().lower()
+        choice = input(f"Enter 1-{len(DATABASES)}: ").strip().lower()
         if choice.isdigit() and 1 <= int(choice) <= len(DATABASES):
             return DATABASES[int(choice) - 1]
 
@@ -112,7 +89,8 @@ def select_database(selected_key: str | None) -> Database:
             if choice == db.key:
                 return db
 
-        print("Invalid selection. Use 1, 2, aisl, or cmp.")
+        valid_keys = ", ".join(db.key for db in DATABASES)
+        print(f"Invalid selection. Use 1-{len(DATABASES)} or one of: {valid_keys}.")
 
 
 def generate_snapshot_id(db: Database) -> str:
@@ -162,12 +140,12 @@ def create_snapshot(rds_client, db: Database, snapshot_id: str) -> None:
 
     if db.snapshot_type == "cluster":
         rds_client.create_db_cluster_snapshot(
-            DBClusterIdentifier=db.identifier,
+            DBClusterIdentifier=db.source_id,
             DBClusterSnapshotIdentifier=snapshot_id,
         )
     else:
         rds_client.create_db_snapshot(
-            DBInstanceIdentifier=db.identifier,
+            DBInstanceIdentifier=db.source_id,
             DBSnapshotIdentifier=snapshot_id,
         )
 
@@ -216,7 +194,7 @@ def main() -> int:
 
     print()
     print(f"DB:       {db.name}")
-    print(f"Target:   {db.identifier}")
+    print(f"Target:   {db.source_id}")
     print(f"Region:   {args.region}")
     print(f"Snapshot: {snapshot_id}")
 

@@ -10,50 +10,32 @@ Steps:
 """
 
 import argparse
+import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 import boto3
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
+from database_catalog import DATABASES, DATABASES_BY_KEY, Database
+
 
 load_dotenv()
 
-
-@dataclass(frozen=True)
-class Database:
-    key: str
-    name: str
-    snapshot_type: str
-    source_id: str
-    default_schema: str
-
-
-DATABASES = {
-    "aisl": Database(
-        key="aisl",
-        name="AI Shipping Labs",
-        snapshot_type="instance",
-        source_id="ai-shipping-labs",
-        default_schema="aisl_prod",
-    ),
-    "cmp": Database(
-        key="cmp",
-        name="Course Management",
-        snapshot_type="cluster",
-        source_id="course-management-manual",
-        default_schema="prod",
-    ),
-}
+LOCAL_TMP = Path(os.getenv("LOCAL_TMP", "/data/tmp/rds-export"))
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the full RDS backup pipeline.")
-    parser.add_argument("--db", choices=["aisl", "cmp", "all"], required=True)
+    parser.add_argument(
+        "--db",
+        choices=[*DATABASES_BY_KEY, "all"],
+        required=True,
+    )
     parser.add_argument("--schema", help="Schema/database to convert to SQLite.")
     parser.add_argument("--region", default="eu-west-1", help="AWS region.")
     parser.add_argument("--poll-interval", type=int, default=30, help="Seconds between snapshot status checks.")
@@ -65,8 +47,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_step(command: list[str]) -> None:
-    subprocess.run(command, check=True)
+def target_environment(db: Database) -> dict[str, str]:
+    """Give each database an isolated export/conversion workspace."""
+    return {
+        **os.environ,
+        "LOCAL_TMP": str(LOCAL_TMP / db.key),
+    }
+
+
+def run_step(command: list[str], db: Database) -> None:
+    subprocess.run(command, check=True, env=target_environment(db))
 
 
 def snapshot_exists(rds_client, db: Database, snapshot_id: str) -> bool:
@@ -150,7 +140,7 @@ def export_snapshot(db: Database, snapshot_id: str, cleanup_export_s3: bool) -> 
     else:
         command.append("--keep-s3")
 
-    run_step(command)
+    run_step(command, db)
 
 
 def resolve_schema(db: Database, schema: str | None) -> str:
@@ -169,13 +159,16 @@ def resolve_schema(db: Database, schema: str | None) -> str:
 def convert_and_upload_sqlite(db: Database, schema: str) -> None:
     print()
     print(f"=== {db.name}: convert {schema} to SQLite and upload ===")
-    run_step([
-        sys.executable,
-        "parquet_to_sqlite.py",
-        "--schema",
-        schema,
-        "--upload-s3",
-    ])
+    run_step(
+        [
+            sys.executable,
+            "parquet_to_sqlite.py",
+            "--schema",
+            schema,
+            "--upload-s3",
+        ],
+        db,
+    )
 
 
 def run_pipeline(db: Database, args: argparse.Namespace) -> None:
@@ -191,7 +184,7 @@ def main() -> int:
         print("--poll-interval must be at least 1 second.")
         return 1
 
-    selected_dbs = DATABASES.values() if args.db == "all" else [DATABASES[args.db]]
+    selected_dbs = DATABASES if args.db == "all" else [DATABASES_BY_KEY[args.db]]
 
     try:
         for db in selected_dbs:

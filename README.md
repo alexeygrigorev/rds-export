@@ -31,13 +31,18 @@ Runs snapshot creation, export, SQLite conversion, and SQLite upload to S3.
 uv run run_pipeline.py --db cmp --schema prod
 uv run run_pipeline.py --db aisl --schema aisl_prod
 
-# Both databases
+# All four production databases
 uv run run_pipeline.py --db all
+
+# Website or Relay only
+uv run run_pipeline.py --db website
+uv run run_pipeline.py --db relay
 ```
 
 By default, the pipeline keeps the Parquet export files in S3. Use `--cleanup-export-s3` to delete them after the local zip is created.
-If `--schema` is omitted, the pipeline uses the default schema for each database:
-`prod` for CMP and `aisl_prod` for AI Shipping Labs.
+If `--schema` is omitted, the pipeline uses the default database/schema for
+each target: `prod` for CMP, `aisl_prod` for AI Shipping Labs, `dtc_website`
+for the website, and `relay` for Relay.
 
 ### Hetzner Cron
 
@@ -58,11 +63,21 @@ ssh hetzner 'cd ~/rds-export && uv sync'
 Crontab entries:
 
 ```cron
-0 1 * * * cd /home/alexey/rds-export && /home/alexey/.local/bin/uv run run_pipeline.py --db cmp --schema prod >> /home/alexey/rds-export/logs/cmp.log 2>&1
-0 2 * * * cd /home/alexey/rds-export && /home/alexey/.local/bin/uv run run_pipeline.py --db aisl --schema aisl_prod >> /home/alexey/rds-export/logs/aisl.log 2>&1
+CRON_TZ=UTC
+0 18 * * * cd /home/alexey/rds-export && /usr/bin/flock -n /tmp/rds-export-cmp.lock /home/alexey/.local/bin/uv run run_pipeline.py --db cmp --schema prod >> /home/alexey/rds-export/logs/cmp.log 2>&1
+0 19 * * * cd /home/alexey/rds-export && /usr/bin/flock -n /tmp/rds-export-aisl.lock /home/alexey/.local/bin/uv run run_pipeline.py --db aisl --schema aisl_prod >> /home/alexey/rds-export/logs/aisl.log 2>&1
+0 20 * * * cd /home/alexey/rds-export && /usr/bin/flock -n /tmp/rds-export-website.lock /home/alexey/.local/bin/uv run run_pipeline.py --db website --schema dtc_website >> /home/alexey/rds-export/logs/website.log 2>&1
+0 21 * * * cd /home/alexey/rds-export && /usr/bin/flock -n /tmp/rds-export-relay.lock /home/alexey/.local/bin/uv run run_pipeline.py --db relay --schema relay >> /home/alexey/rds-export/logs/relay.log 2>&1
 ```
 
-Create `~/rds-export/logs` before enabling cron. The server timezone is CEST, so these run at 01:00 and 02:00 server time.
+Create `~/rds-export/logs` before enabling cron. `CRON_TZ=UTC` makes the
+schedule independent of daylight-saving changes. These jobs start outside all
+four RDS automated-backup windows (02:00-04:00 UTC) and finish before the
+separate locked-vault AWS Backup plan starts at 00:00 UTC.
+
+Each target uses its own `${LOCAL_TMP}/<db-key>` workspace. That isolation is
+required because the jobs may overlap: without it, one pipeline could select
+another database's most recent export zip during SQLite conversion.
 
 ### 1. Create RDS Snapshot
 
@@ -70,6 +85,8 @@ Creates a manual RDS snapshot for one of the configured databases:
 
 - `aisl` - `ai-shipping-labs`, snapshot names like `aisl-YYYY-MM-DD`
 - `cmp` - `course-management-manual`, snapshot names like `cmp-YYYY-MM-DD`
+- `website` - `website-production`, snapshot names like `website-YYYY-MM-DD`
+- `relay` - `relay-production`, snapshot names like `relay-YYYY-MM-DD`
 
 ```bash
 # Interactive mode
@@ -78,6 +95,8 @@ uv run create_snapshot.py
 # Select a database directly
 uv run create_snapshot.py --db aisl
 uv run create_snapshot.py --db cmp
+uv run create_snapshot.py --db website
+uv run create_snapshot.py --db relay
 
 # Start the snapshot and exit immediately
 uv run create_snapshot.py --db cmp --no-wait
