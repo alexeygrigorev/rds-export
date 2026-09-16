@@ -163,8 +163,9 @@ Use `--list` to see available schemas/databases in the selected zip.
 
 ### 4. Clean Up Old Manual Snapshots
 
-Lists manual RDS snapshots older than a retention window and optionally deletes
-them. The command is a dry run unless `--delete` is passed.
+Lists manual RDS snapshots beyond a retention limit and optionally deletes them.
+Retention is either a count (`--keep-last`) or an age (`--retention-days`,
+the default). The command is a dry run unless `--delete` is passed.
 
 ```bash
 # Dry run for AI Shipping Labs instance snapshots older than 7 days

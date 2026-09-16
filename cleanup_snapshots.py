@@ -79,6 +79,14 @@ def parse_args() -> argparse.Namespace:
         help="Keep snapshots newer than this many days.",
     )
     parser.add_argument(
+        "--keep-last",
+        type=int,
+        help=(
+            "Keep this many most recent snapshots and delete the rest, "
+            "ignoring --retention-days."
+        ),
+    )
+    parser.add_argument(
         "--delete",
         action="store_true",
         help="Delete matching snapshots. Without this, the command is a dry run.",
@@ -106,6 +114,9 @@ def verify_aws(session: boto3.Session) -> None:
 def validate_args(args: argparse.Namespace) -> None:
     if args.retention_days < 1:
         raise SystemExit("--retention-days must be at least 1.")
+
+    if args.keep_last is not None and args.keep_last < 1:
+        raise SystemExit("--keep-last must be at least 1.")
 
     if args.db_instance_id and args.db_cluster_id:
         raise SystemExit("Use only one of --db-instance-id or --db-cluster-id.")
@@ -240,6 +251,17 @@ def select_expired_snapshots(
     ]
 
 
+def select_surplus_snapshots(
+    snapshots: list[Snapshot],
+    keep_last: int,
+) -> list[Snapshot]:
+    """Everything but the `keep_last` most recent snapshots, oldest first."""
+    ordered = sorted(snapshots, key=lambda snapshot: snapshot.created_at)
+    if keep_last <= 0:
+        return ordered
+    return ordered[:-keep_last]
+
+
 def format_size(size_gb: int | None) -> str:
     if size_gb is None:
         return "-"
@@ -299,19 +321,24 @@ def main() -> int:
     rds_client = session.client("rds")
 
     snapshots = list_manual_snapshots(rds_client, args)
-    expired_snapshots = select_expired_snapshots(snapshots, args.retention_days)
+    if args.keep_last is not None:
+        doomed_snapshots = select_surplus_snapshots(snapshots, args.keep_last)
+        retention = f"{args.keep_last} most recent snapshots"
+    else:
+        doomed_snapshots = select_expired_snapshots(snapshots, args.retention_days)
+        retention = f"{args.retention_days} days"
 
-    print_snapshots(expired_snapshots)
+    print_snapshots(doomed_snapshots)
     print()
-    log_info(f"Matched old manual snapshots: {len(expired_snapshots)}")
-    log_info(f"Retention: {args.retention_days} days")
+    log_info(f"Matched old manual snapshots: {len(doomed_snapshots)}")
+    log_info(f"Retention: {retention}")
     log_info(f"Region: {args.region}")
 
     if not args.delete:
         log_warn("Dry run only. Pass --delete to delete these snapshots.")
         return 0
 
-    delete_snapshots(rds_client, expired_snapshots)
+    delete_snapshots(rds_client, doomed_snapshots)
     log_info("Deletion requests submitted.")
     return 0
 
