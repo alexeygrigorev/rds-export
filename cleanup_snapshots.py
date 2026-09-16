@@ -150,12 +150,12 @@ def normalize_cluster_snapshot(snapshot: dict, now: datetime) -> Snapshot:
 
 def list_instance_snapshots(
     rds_client,
-    args: argparse.Namespace,
     now: datetime,
+    db_instance_id: str | None = None,
 ) -> list[Snapshot]:
     paginate_args = {"SnapshotType": "manual"}
-    if args.db_instance_id:
-        paginate_args["DBInstanceIdentifier"] = args.db_instance_id
+    if db_instance_id:
+        paginate_args["DBInstanceIdentifier"] = db_instance_id
 
     snapshots = []
     paginator = rds_client.get_paginator("describe_db_snapshots")
@@ -170,12 +170,12 @@ def list_instance_snapshots(
 
 def list_cluster_snapshots(
     rds_client,
-    args: argparse.Namespace,
     now: datetime,
+    db_cluster_id: str | None = None,
 ) -> list[Snapshot]:
     paginate_args = {"SnapshotType": "manual"}
-    if args.db_cluster_id:
-        paginate_args["DBClusterIdentifier"] = args.db_cluster_id
+    if db_cluster_id:
+        paginate_args["DBClusterIdentifier"] = db_cluster_id
 
     snapshots = []
     paginator = rds_client.get_paginator("describe_db_cluster_snapshots")
@@ -188,28 +188,45 @@ def list_cluster_snapshots(
     return snapshots
 
 
-def list_manual_snapshots(rds_client, args: argparse.Namespace) -> list[Snapshot]:
+def find_manual_snapshots(
+    rds_client,
+    db_instance_id: str | None = None,
+    db_cluster_id: str | None = None,
+    snapshot_prefix: str | None = None,
+    snapshot_kind: str = "both",
+) -> list[Snapshot]:
+    """Collect manual snapshots, oldest first, narrowed by the given filters."""
     now = datetime.now(timezone.utc)
     snapshots = []
 
-    if args.db_instance_id:
-        snapshots.extend(list_instance_snapshots(rds_client, args, now))
-    elif args.db_cluster_id:
-        snapshots.extend(list_cluster_snapshots(rds_client, args, now))
+    if db_instance_id:
+        snapshots.extend(list_instance_snapshots(rds_client, now, db_instance_id))
+    elif db_cluster_id:
+        snapshots.extend(list_cluster_snapshots(rds_client, now, db_cluster_id))
     else:
-        if args.snapshot_kind in {"instance", "both"}:
-            snapshots.extend(list_instance_snapshots(rds_client, args, now))
-        if args.snapshot_kind in {"cluster", "both"}:
-            snapshots.extend(list_cluster_snapshots(rds_client, args, now))
+        if snapshot_kind in {"instance", "both"}:
+            snapshots.extend(list_instance_snapshots(rds_client, now))
+        if snapshot_kind in {"cluster", "both"}:
+            snapshots.extend(list_cluster_snapshots(rds_client, now))
 
-    if args.snapshot_prefix:
+    if snapshot_prefix:
         snapshots = [
             snapshot
             for snapshot in snapshots
-            if snapshot.identifier.startswith(args.snapshot_prefix)
+            if snapshot.identifier.startswith(snapshot_prefix)
         ]
 
     return sorted(snapshots, key=lambda snapshot: snapshot.created_at)
+
+
+def list_manual_snapshots(rds_client, args: argparse.Namespace) -> list[Snapshot]:
+    return find_manual_snapshots(
+        rds_client,
+        db_instance_id=args.db_instance_id,
+        db_cluster_id=args.db_cluster_id,
+        snapshot_prefix=args.snapshot_prefix,
+        snapshot_kind=args.snapshot_kind,
+    )
 
 
 def select_expired_snapshots(
