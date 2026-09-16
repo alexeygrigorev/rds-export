@@ -3,10 +3,14 @@
 Run the full RDS backup pipeline.
 
 Steps:
-1. Create a manual RDS snapshot.
-2. Export the snapshot to S3 and download a zip archive.
-3. Convert the selected schema to SQLite.
-4. Upload the SQLite database back to S3.
+1. Delete this database's oldest snapshots, keeping the most recent ones.
+2. Create a manual RDS snapshot.
+3. Export the snapshot to S3 and download a zip archive.
+4. Convert the selected schema to SQLite.
+5. Upload the SQLite database back to S3.
+
+Pruning runs before the snapshot is created: RDS enforces a hard cap of 100
+manual snapshots per kind, so room has to be freed before CreateDBSnapshot.
 """
 
 import argparse
@@ -21,6 +25,7 @@ import boto3
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
+from cleanup_snapshots import prune_database_snapshots
 from database_catalog import DATABASES, DATABASES_BY_KEY, Database
 
 
@@ -39,6 +44,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--schema", help="Schema/database to convert to SQLite.")
     parser.add_argument("--region", default="eu-west-1", help="AWS region.")
     parser.add_argument("--poll-interval", type=int, default=30, help="Seconds between snapshot status checks.")
+    parser.add_argument(
+        "--keep-last",
+        type=int,
+        default=5,
+        help="Snapshots to retain per database before creating the new one.",
+    )
+    parser.add_argument(
+        "--no-prune",
+        action="store_true",
+        help="Skip deleting old snapshots before creating the new one.",
+    )
     parser.add_argument(
         "--cleanup-export-s3",
         action="store_true",
@@ -89,6 +105,12 @@ def snapshot_status(rds_client, db: Database, snapshot_id: str) -> str:
         DBSnapshotIdentifier=snapshot_id
     )
     return response["DBSnapshots"][0]["Status"].lower()
+
+
+def prune_snapshots(rds_client, db: Database, keep_last: int) -> None:
+    print()
+    print(f"=== {db.name}: prune old snapshots ===")
+    prune_database_snapshots(rds_client, db, keep_last)
 
 
 def create_snapshot(rds_client, db: Database, poll_interval: int) -> str:
@@ -173,6 +195,8 @@ def convert_and_upload_sqlite(db: Database, schema: str) -> None:
 
 def run_pipeline(db: Database, args: argparse.Namespace) -> None:
     rds_client = boto3.client("rds", region_name=args.region)
+    if not args.no_prune:
+        prune_snapshots(rds_client, db, args.keep_last)
     snapshot_id = create_snapshot(rds_client, db, args.poll_interval)
     export_snapshot(db, snapshot_id, args.cleanup_export_s3)
     convert_and_upload_sqlite(db, resolve_schema(db, args.schema))
@@ -182,6 +206,10 @@ def main() -> int:
     args = parse_args()
     if args.poll_interval < 1:
         print("--poll-interval must be at least 1 second.")
+        return 1
+
+    if args.keep_last < 1:
+        print("--keep-last must be at least 1.")
         return 1
 
     selected_dbs = DATABASES if args.db == "all" else [DATABASES_BY_KEY[args.db]]

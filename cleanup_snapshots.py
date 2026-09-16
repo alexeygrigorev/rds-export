@@ -13,6 +13,8 @@ import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 from dotenv import load_dotenv
 
+from database_catalog import Database
+
 
 load_dotenv()
 
@@ -240,6 +242,20 @@ def list_manual_snapshots(rds_client, args: argparse.Namespace) -> list[Snapshot
     )
 
 
+def snapshots_for_database(rds_client, db: Database) -> list[Snapshot]:
+    """Snapshots this pipeline created for one database, oldest first.
+
+    Scoped to the source DB *and* the `<key>-` identifier prefix so unrelated
+    manual snapshots on the same source are never selected for deletion.
+    """
+    return find_manual_snapshots(
+        rds_client,
+        db_instance_id=db.source_id if db.snapshot_type == "instance" else None,
+        db_cluster_id=db.source_id if db.snapshot_type == "cluster" else None,
+        snapshot_prefix=f"{db.key}-",
+    )
+
+
 def select_expired_snapshots(
     snapshots: list[Snapshot],
     retention_days: int,
@@ -310,6 +326,27 @@ def delete_snapshots(rds_client, snapshots: list[Snapshot]) -> None:
 
         log_info(f"Deleting {snapshot.kind} snapshot: {snapshot.identifier}")
         delete_snapshot(rds_client, snapshot)
+
+
+def prune_database_snapshots(
+    rds_client,
+    db: Database,
+    keep_last: int,
+    delete: bool = True,
+) -> list[Snapshot]:
+    """Delete this database's pipeline snapshots beyond the newest `keep_last`."""
+    snapshots = snapshots_for_database(rds_client, db)
+    surplus = select_surplus_snapshots(snapshots, keep_last)
+
+    log_info(
+        f"{db.name}: {len(snapshots)} snapshot(s), keeping {keep_last}, "
+        f"deleting {len(surplus)}"
+    )
+
+    if surplus and delete:
+        delete_snapshots(rds_client, surplus)
+
+    return surplus
 
 
 def main() -> int:

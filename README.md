@@ -24,7 +24,8 @@ read/write the backup bucket, and use the export KMS key.
 
 ### Full Pipeline
 
-Runs snapshot creation, export, SQLite conversion, and SQLite upload to S3.
+Runs snapshot pruning, snapshot creation, export, SQLite conversion, and SQLite
+upload to S3.
 
 ```bash
 # One database
@@ -38,6 +39,16 @@ uv run run_pipeline.py --db all
 uv run run_pipeline.py --db website
 uv run run_pipeline.py --db relay
 ```
+
+Before creating a snapshot the pipeline deletes that database's older
+snapshots, keeping the 5 most recent (`--keep-last 5` by default; `--no-prune`
+skips the step). RDS caps manual snapshots at 100 per kind — instance and
+cluster are counted separately — and hitting the cap fails `CreateDBSnapshot`
+with `SnapshotQuotaExceeded`, so room is freed first rather than after.
+
+Pruning is scoped to the source DB *and* the `<key>-` snapshot prefix, so
+unrelated manual snapshots on the same source (for example the retired
+clusters' `*-final-snapshot`) are never deleted.
 
 By default, the pipeline keeps the Parquet export files in S3. Use `--cleanup-export-s3` to delete them after the local zip is created.
 If `--schema` is omitted, the pipeline uses the default database/schema for
@@ -166,6 +177,8 @@ Use `--list` to see available schemas/databases in the selected zip.
 Lists manual RDS snapshots beyond a retention limit and optionally deletes them.
 Retention is either a count (`--keep-last`) or an age (`--retention-days`,
 the default). The command is a dry run unless `--delete` is passed.
+
+The pipeline prunes automatically, so this script is for one-off cleanups.
 
 ```bash
 # Dry run for AI Shipping Labs instance snapshots older than 7 days
