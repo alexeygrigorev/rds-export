@@ -137,13 +137,15 @@ def extract_schema(zip_path: Path, schema: str, extract_dir: Path) -> Path:
     return schema_dir
 
 
-def find_parquet_files(schema_dir: Path) -> dict[str, Path]:
-    """Find all Parquet files and map table names to files.
+def find_parquet_files(schema_dir: Path) -> dict[str, list[Path]]:
+    """Find all Parquet files and map table names to their part files.
+
+    A large table is exported as several part files, so every part is kept.
 
     Returns:
-        Dict mapping table names to their Parquet file paths.
+        Dict mapping table names to their sorted Parquet part file paths.
     """
-    parquet_files = {}
+    parquet_files: dict[str, list[Path]] = {}
 
     for parquet_path in schema_dir.rglob("*.parquet"):
         # Path relative to schema_dir: schema/schema.table_name/N/part-*.parquet
@@ -155,9 +157,9 @@ def find_parquet_files(schema_dir: Path) -> dict[str, Path]:
         if parts:
             full_table_name = parts[0]
             table_name = full_table_name.split(".", 1)[-1] if "." in full_table_name else full_table_name
-            parquet_files[table_name] = parquet_path
+            parquet_files.setdefault(table_name, []).append(parquet_path)
 
-    return parquet_files
+    return {table_name: sorted(paths) for table_name, paths in parquet_files.items()}
 
 
 def arrow_type_to_sqlite(arrow_type: pa.DataType) -> str:
@@ -209,11 +211,11 @@ def convert_arrow_value(value):
 
 
 def import_parquet_to_sqlite(
-    parquet_path: Path,
+    parquet_paths: list[Path],
     conn: sqlite3.Connection,
     table_name: str,
 ) -> int:
-    """Import a Parquet file into SQLite.
+    """Import a table's Parquet part files into SQLite.
 
     Returns:
         Number of rows imported.
@@ -222,7 +224,10 @@ def import_parquet_to_sqlite(
 
     try:
         # Read Parquet file with PyArrow
-        table = pq.read_table(parquet_path)
+        table = pa.concat_tables(
+            [pq.read_table(path) for path in parquet_paths],
+            promote_options="permissive",
+        )
 
         if table.num_rows == 0:
             log_warn(f"    No data in {table_name}")
@@ -430,8 +435,8 @@ def main() -> int:
     total_rows = 0
     imported_tables = 0
 
-    for table_name, parquet_path in sorted(parquet_files.items()):
-        rows = import_parquet_to_sqlite(parquet_path, conn, table_name)
+    for table_name, parquet_paths in sorted(parquet_files.items()):
+        rows = import_parquet_to_sqlite(parquet_paths, conn, table_name)
         if rows > 0:
             total_rows += rows
             imported_tables += 1
