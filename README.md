@@ -90,6 +90,50 @@ Each target uses its own `${LOCAL_TMP}/<db-key>` workspace. That isolation is
 required because the jobs may overlap: without it, one pipeline could select
 another database's most recent export zip during SQLite conversion.
 
+### Contabo Coolify backups
+
+The `website-production` RDS instance was retired, so its SnapshotExport
+only produces empty 0-byte `rds-dtc_website-*.db` artifacts (and the CMP
+RDS export lags behind the live Coolify database). The live databases are
+backed up on Contabo as pg_dump custom-format dumps
+(`/var/backups/coolify-postgres/*-pg-shared-*.dump.gz`, magic `PGDMP`),
+which the dtc-website importers reject with `source-not-sqlite`.
+`contabo_dump_to_sqlite.py` converts those dumps to SQLite without
+touching any live database: it expands the dump to plain SQL with
+`pg_restore` (read-only) and streams the `CREATE TABLE` / `COPY` sections
+into SQLite, keeping the existing artifact naming
+(`rds-<schema>-YYYYMMDD-HHMMSS.db`).
+
+```bash
+# Newest matching remote dump over SSH (used by cron)
+uv run contabo_dump_to_sqlite.py \
+  --remote contabo-b:/var/backups/coolify-postgres/website-pg-shared-*.dump.gz \
+  --schema dtc_website --out-dir /data/tmp/rds-export/website
+
+# Local dump file (.dump or .dump.gz)
+uv run contabo_dump_to_sqlite.py \
+  --dump /tmp/website-pg-shared-20261022.dump.gz \
+  --schema dtc_website --out-dir /data/tmp/rds-export/website
+
+# CMP equivalent (schema prod, out-dir /data/tmp/rds-export/cmp)
+uv run contabo_dump_to_sqlite.py \
+  --remote contabo-b:/var/backups/coolify-postgres/cmp-pg-shared-*.dump.gz \
+  --schema prod --out-dir /data/tmp/rds-export/cmp
+```
+
+Postgres `t`/`f` booleans are normalized to `1`/`0` so the SQLite
+matches what the importers expect; tables with no rows are still created.
+The 60 MB CMP dump converts to ~390 MB / 45 tables / ~814k rows; the
+website dump to ~0.8 MB / 166 tables.
+
+The website SnapshotExport cron line stays disabled (it only emits empty
+artifacts). Its replacement runs daily in the old website slot:
+
+```cron
+CRON_TZ=UTC
+0 20 * * * cd /home/alexey/rds-export && /usr/bin/flock -n /tmp/rds-export-website-contabo.lock ./notify_run.sh website-contabo /home/alexey/.local/bin/uv run --frozen contabo_dump_to_sqlite.py --remote contabo-b:/var/backups/coolify-postgres/website-pg-shared-*.dump.gz --schema dtc_website --out-dir /data/tmp/rds-export/website >> /home/alexey/rds-export/logs/website-contabo.log 2>&1
+```
+
 An initial database with no schemas or tables still produces a successful RDS
 Parquet export. When the pipeline supplied an explicit `--schema`, the
 converter records that state as a valid empty SQLite artifact and uploads it.
