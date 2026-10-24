@@ -59,7 +59,7 @@ for the website, and `relay` for Relay.
 
 `notify_run.sh <label> <command...>` streams the command output and sends its
 last 50 lines through the Datamailer CLI on failure, preserving the command's
-exit status. It explicitly selects Relay sender id `backup-alerts`, which must
+exit status. It explicitly selects Relay sender id `alerts`, which must
 be configured on the Hetzner Maintenance client as `DTC Alerts <alerts@dtcdev.click>`.
 The dtcdev.click SES identity stays in sandbox account 817685572750, us-east-1;
 Relay must route that From domain to the sandbox send role. The wrapper keeps
@@ -69,7 +69,7 @@ Relay must route that From domain to the sandbox send role. The wrapper keeps
 Configure the existing client only after verifying its sandbox SES route:
 
 ```bash
-datamailer senders --set 'backup-alerts=DTC Alerts <alerts@dtcdev.click>'
+datamailer senders --set 'alerts=DTC Alerts <alerts@dtcdev.click>'
 ```
 
 A controlled failure test can override `BACKUP_ALERT_EMAIL=dev@dtcdev.click`

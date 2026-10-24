@@ -43,7 +43,7 @@ class NotifyRunTests(unittest.TestCase):
         self.assertEqual(result.returncode, 37)
         self.assertIn("controlled-backup-failure", result.stdout)
         self.assertEqual(message["args"], [
-            "send", "--from", "backup-alerts", "--to", "dev@dtcdev.click",
+            "send", "--from", "alerts", "--to", "dev@dtcdev.click",
             "--subject", "Backup failure: website-contabo (exit 37)",
         ])
         self.assertIn("controlled-backup-failure", message["body"])

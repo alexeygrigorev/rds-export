@@ -12,7 +12,7 @@
 # Config (env, with sensible defaults):
 #   BACKUP_ALERT_EMAIL   recipient        (default: alexey.s.grigoriev@gmail.com)
 #   DATAMAILER_BIN       datamailer path  (default: $HOME/.local/bin/datamailer)
-# Relay client sender id backup-alerts must resolve to
+# Relay client sender id alerts must resolve to
 # DTC Alerts <alerts@dtcdev.click>; do not rely on the client's default sender.
 
 set -uo pipefail
@@ -46,7 +46,7 @@ if [ "$status" -ne 0 ]; then
         echo "----- last 50 lines of output -----"
         tail -n 50 "$out"
     } | "$datamailer_bin" send \
-        --from backup-alerts \
+        --from alerts \
         --to "$recipient" \
         --subject "Backup failure: $label (exit $status)"
 fi
