@@ -57,6 +57,25 @@ for the website, and `relay` for Relay.
 
 ### Hetzner Cron
 
+`notify_run.sh <label> <command...>` streams the command output and sends its
+last 50 lines through the Datamailer CLI on failure, preserving the command's
+exit status. It explicitly selects Relay sender id `backup-alerts`, configured
+on the Hetzner Maintenance client as `DTC Alerts <alerts@dtcdev.click>`.
+The dtcdev.click SES identity stays in sandbox account 817685572750, us-east-1;
+Relay routes that From domain to the sandbox send role. The wrapper keeps
+`BACKUP_ALERT_EMAIL` unchanged (default `alexey.s.grigoriev@gmail.com`).
+`DATAMAILER_BIN` can select a different CLI executable.
+
+Configure the existing client only after verifying its sandbox SES route:
+
+```bash
+datamailer senders --set 'backup-alerts=DTC Alerts <alerts@dtcdev.click>'
+```
+
+A controlled failure test can override `BACKUP_ALERT_EMAIL=dev@dtcdev.click`
+for that invocation alone. Verify the received From and authentication results,
+and the dev-mailbox webhook's successful POST, before declaring the cutover done.
+
 The Hetzner host uses the SSH alias `hetzner`. The deployed checkout lives at:
 
 ```bash
